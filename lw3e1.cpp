@@ -1,194 +1,158 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 
 #define N 100000000LL
-#define BLOCK_SIZE (4314170)
+#define STUDENT_TICKET 431417
+#define BLOCK_SIZE (10LL * STUDENT_TICKET)  // 4 314 170
 
-typedef struct {
+// Выравнивание структуры на 64 байта (размер кэш-линии) предотвращает эффект False Sharing,
+// когда разные потоки пишут в соседние переменные и заставляют процессор сбрасывать кэш.
+__declspec(align(64)) struct ThreadData {
     int id;
-    HANDLE event_done;
-    long long start;
-    long long end;
-    volatile int stop;
-    volatile BOOL ready_to_sleep;
-    CRITICAL_SECTION* cs_suspend;
-} ThreadData;
+    HANDLE event_done;      // Событие: "я закончил вычисления"
+    long long start;        // Начало блока
+    long long end;          // Конец блока
+    double local_sum;       // Локальный результат блока
+    volatile int stop;      // Флаг завершения работы потока
+};
 
+// Функция рабочего потока
 DWORD WINAPI WorkerThread(LPVOID param) {
     ThreadData* data = (ThreadData*)param;
-    double local_sum;
 
     while (1) {
-        local_sum = 0.0;
-        for (long long i = data->start; i < data->end; ++i) {
-            double term = 1.0 / (2.0 * i + 1.0);
-            if (i & 1)
-                local_sum -= term;
-            else
-                local_sum += term;
+        if (data->stop) break;
+
+        double local_sum = 0.0;
+        long long i = data->start;
+        
+        // Оптимизированный цикл: шаг 2 избавляет от if внутри горячего цикла
+        for (; i + 1 < data->end; i += 2) {
+            local_sum += 1.0 / (2.0 * i + 1.0);             // Четная итерация (+)
+            local_sum -= 1.0 / (2.0 * (i + 1) + 1.0);       // Нечетная итерация (-)
+        }
+        
+        // Обработка последнего элемента, если размер блока нечетный
+        if (i < data->end) {
+            local_sum += 1.0 / (2.0 * i + 1.0);
         }
 
-        extern CRITICAL_SECTION cs_sum;
-        EnterCriticalSection(&cs_sum);
-        extern double total_sum;
-        total_sum += local_sum;
-        LeaveCriticalSection(&cs_sum);
+        data->local_sum = local_sum;
 
+        // Сигнализируем главному потоку, что блок готов
         SetEvent(data->event_done);
 
-        EnterCriticalSection(data->cs_suspend);
-        data->ready_to_sleep = TRUE;
-        LeaveCriticalSection(data->cs_suspend);
-
+        // Приостанавливаем сами себя до получения следующего блока (требование задания)
         SuspendThread(GetCurrentThread());
-
-        EnterCriticalSection(data->cs_suspend);
-        data->ready_to_sleep = FALSE;
-        LeaveCriticalSection(data->cs_suspend);
-
-        // Проверка на завершение
-        if (data->stop) break;
     }
     return 0;
 }
-
-CRITICAL_SECTION cs_sum;
-double total_sum = 0.0;
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <num_threads>\n", argv[0]);
         return 1;
     }
+
     int num_threads = atoi(argv[1]);
     if (num_threads < 1) {
-        fprintf(stderr, "Number of threads must be positive.\n");
+        fprintf(stderr, "Number of threads must be >= 1\n");
         return 1;
     }
 
-    InitializeCriticalSection(&cs_sum);
-    CRITICAL_SECTION cs_suspend;
-    InitializeCriticalSection(&cs_suspend);
-
+    // Выделение памяти
     HANDLE* threads = (HANDLE*)malloc(num_threads * sizeof(HANDLE));
-    ThreadData* thread_data = (ThreadData*)malloc(num_threads * sizeof(ThreadData));
     HANDLE* events = (HANDLE*)malloc(num_threads * sizeof(HANDLE));
-    if (!threads || !thread_data || !events) {
-        fprintf(stderr, "Memory allocation failed.\n");
-        DeleteCriticalSection(&cs_sum);
-        DeleteCriticalSection(&cs_suspend);
-        return 1;
-    }
+    ThreadData* thread_data = (ThreadData*)_aligned_malloc(num_threads * sizeof(ThreadData), 64);
 
+    // Инициализация
     for (int i = 0; i < num_threads; ++i) {
+        // Создаем событие с автосбросом (Auto-reset event)
         events[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
-        if (!events[i]) {
-            fprintf(stderr, "CreateEvent failed for thread %d\n", i);
-            // очистка
-            for (int j = 0; j < i; ++j) CloseHandle(events[j]);
-            free(threads); free(thread_data); free(events);
-            DeleteCriticalSection(&cs_sum);
-            DeleteCriticalSection(&cs_suspend);
-            return 1;
-        }
+        
         thread_data[i].id = i;
         thread_data[i].event_done = events[i];
-        thread_data[i].start = 0;
-        thread_data[i].end = 0;
         thread_data[i].stop = 0;
-        thread_data[i].ready_to_sleep = FALSE;
-        thread_data[i].cs_suspend = &cs_suspend;
+        thread_data[i].local_sum = 0.0;
 
-        threads[i] = CreateThread(NULL, 0, WorkerThread, &thread_data[i],
-                                  CREATE_SUSPENDED, NULL);
-        if (!threads[i]) {
-            fprintf(stderr, "CreateThread failed for thread %d\n", i);
-            for (int j = 0; j <= i; ++j) {
-                if (events[j]) CloseHandle(events[j]);
-                if (threads[j]) CloseHandle(threads[j]);
-            }
-            free(threads); free(thread_data); free(events);
-            DeleteCriticalSection(&cs_sum);
-            DeleteCriticalSection(&cs_suspend);
-            return 1;
-        }
-    }
-
-    total_sum = 0.0;
-    long long next_block_start = 0;
-
-    for (int i = 0; i < num_threads && next_block_start < N; ++i) {
-        thread_data[i].start = next_block_start;
-        thread_data[i].end = next_block_start + BLOCK_SIZE;
-        if (thread_data[i].end > N) thread_data[i].end = N;
-        next_block_start += BLOCK_SIZE;
-        ResumeThread(threads[i]);   // запустить поток
+        // Создаем потоки сразу в приостановленном состоянии
+        threads[i] = CreateThread(NULL, 0, WorkerThread, &thread_data[i], CREATE_SUSPENDED, NULL);
     }
 
     LARGE_INTEGER freq, start_time, end_time;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start_time);
 
-    while (next_block_start < N) {
-        DWORD idx = WaitForMultipleObjects(num_threads, events, FALSE, INFINITE);
-        if (idx == WAIT_FAILED) {
-            fprintf(stderr, "WaitForMultipleObjects failed\n");
-            break;
-        }
-        idx -= WAIT_OBJECT_0;
+    long long current_block = 0;
+    double total_sum = 0.0;
+    int active_threads = 0;
 
-        while (1) {
-            EnterCriticalSection(&cs_suspend);
-            BOOL ready = thread_data[idx].ready_to_sleep;
-            LeaveCriticalSection(&cs_suspend);
-            if (ready) break;
-            Sleep(0);
-        }
-
-        thread_data[idx].start = next_block_start;
-        thread_data[idx].end = next_block_start + BLOCK_SIZE;
-        if (thread_data[idx].end > N) thread_data[idx].end = N;
-        next_block_start += BLOCK_SIZE;
-
-        ResumeThread(threads[idx]);
+    // Первичное распределение блоков
+    for (int i = 0; i < num_threads && current_block < N; ++i) {
+        thread_data[i].start = current_block;
+        long long end = current_block + BLOCK_SIZE;
+        thread_data[i].end = (end > N) ? N : end;
+        current_block += BLOCK_SIZE;
+        
+        active_threads++;
+        ResumeThread(threads[i]);
     }
 
-    for (int i = 0; i < num_threads; ++i) {
-        WaitForSingleObject(events[i], INFINITE);
+    // Динамическое распределение оставшихся блоков
+    while (active_threads > 0) {
+        // Ждем, пока ХОТЯ БЫ ОДИН поток не завершит свой блок
+        DWORD dwWait = WaitForMultipleObjects(num_threads, events, FALSE, INFINITE);
+        int idx = dwWait - WAIT_OBJECT_0;
+
+        // Собираем результат
+        total_sum += thread_data[idx].local_sum;
+        active_threads--;
+
+        if (current_block < N) {
+            // Если есть еще блоки, выдаем новый
+            thread_data[idx].start = current_block;
+            long long end = current_block + BLOCK_SIZE;
+            thread_data[idx].end = (end > N) ? N : end;
+            current_block += BLOCK_SIZE;
+
+            // БЕЗОПАСНОЕ ПРОБУЖДЕНИЕ:
+            // Убеждаемся, что рабочий поток действительно успел вызвать SuspendThread.
+            // ResumeThread возвращает количество приостановок ДО вызова функции.
+            // Если вернулся 0, значит поток еще в процессе засыпания (между SetEvent и SuspendThread).
+            while (ResumeThread(threads[idx]) == 0) {
+                Sleep(0); // Отдаем квант времени, ждем фактической приостановки
+            }
+            active_threads++;
+        }
     }
 
     QueryPerformanceCounter(&end_time);
     double elapsed = (double)(end_time.QuadPart - start_time.QuadPart) / freq.QuadPart;
 
-    
+    // Корректное завершение всех потоков
     for (int i = 0; i < num_threads; ++i) {
-        while (1) {
-            EnterCriticalSection(&cs_suspend);
-            BOOL ready = thread_data[i].ready_to_sleep;
-            LeaveCriticalSection(&cs_suspend);
-            if (ready) break;
+        thread_data[i].stop = 1;
+        // Будим потоки в последний раз, чтобы они увидели stop = 1 и завершили выполнение (return 0)
+        while (ResumeThread(threads[i]) == 0) {
             Sleep(0);
         }
-        thread_data[i].stop = 1;
-        ResumeThread(threads[i]);
     }
 
+    // Дожидаемся полного выхода потоков
     WaitForMultipleObjects(num_threads, threads, TRUE, INFINITE);
 
     double pi = 4.0 * total_sum;
     printf("pi=%.10f time=%.6f\n", pi, elapsed);
 
+    // Освобождение ресурсов
     for (int i = 0; i < num_threads; ++i) {
-        CloseHandle(threads[i]);
         CloseHandle(events[i]);
+        CloseHandle(threads[i]);
     }
     free(threads);
-    free(thread_data);
     free(events);
-    DeleteCriticalSection(&cs_sum);
-    DeleteCriticalSection(&cs_suspend);
+    _aligned_free(thread_data);
 
     return 0;
 }
